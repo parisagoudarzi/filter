@@ -1,0 +1,441 @@
+{\rtf1\fbidis\ansi\ansicpg1256\deff0\deflang1065{\fonttbl{\f0\fnil\fcharset0 Courier New;}{\f1\fnil\fcharset0 Arial;}}
+{\*\generator Msftedit 5.41.21.2509;}\viewkind4\uc1\pard\ltrpar\lang1033\f0\fs22 #include <stdio.h>\par
+#include <stdlib.h>\par
+#include <stdint.h>\par
+#include <string.h>\par
+#include <assert.h>\par
+\par
+#include "hash_function.h"\par
+\par
+//#define CUCKOO_DEBUG\par
+#define ASSOC_WAY       (4)  /* 4-way association */\par
+#define MAX_KICK_OUT    (64) /* maximum number of cuckoo kicks before claiming failure */\par
+#define HASH_FUNC_NUM   16\par
+#define XIP_VXT_TABLE_SIZE  128\par
+\par
+enum \{ AVAILABLE, OCCUPIED, \};\par
+\par
+/* The hash entries, including the key-value,\par
+ * and the status of the buckets\par
+ */\par
+struct hash_entry \{\par
+    uint32_t key;\par
+    uint32_t status; /* AVAILABLE, OCCUPIED */\par
+    uint32_t value;\par
+\};\par
+\par
+struct hash_table \{\par
+    struct hash_entry **buckets;\par
+    struct hash_entry *items;\par
+\par
+    uint32_t bucket_num;\par
+    uint32_t table_size;\par
+    uint32_t num_items;\par
+\};\par
+\par
+static inline int is_pow_of_2(uint32_t x)\par
+\{\par
+    return !(x & (x-1));\par
+\}\par
+\par
+static inline uint32_t upper_pow_of_2(uint32_t x)\par
+\{\par
+    if (is_pow_of_2(x))\par
+        return x;\par
+\par
+    x |= x >> 1;\par
+    x |= x >> 2;\par
+    x |= x >> 4;\par
+    x |= x >> 8;\par
+    x |= x >> 16;\par
+    return x + 1;\par
+\}\par
+\par
+/*\par
+int cuckoo_hash_put(struct hash_table *table, uint32_t key, uint32_t value);\par
+void cuckoo_hash_remove(struct hash_table *table, uint32_t key);\par
+*/\par
+void cuckoo_insert(uint32_t key, uint32_t value);\par
+void cuckoo_remove(uint32_t key);\par
+int cuckoo_lookup(uint32_t key);\par
+\par
+double load_factor();\par
+void show_hash_table();\par
+int cuckoo_hashing_init(size_t size);\par
+\par
+#endif\par
+\pard\ltrpar\sa200\sl276\slmult1\f1\par
+\par
+\pard\ltrpar\f0 #include "cuckoo_hashing.h"\par
+\par
+static struct hash_table cuckoo_hash_table;\par
+\par
+static uint (* hash_func[HASH_FUNC_NUM])(const unsigned char * str, uint len) = \par
+\{BOB1, JSHash, OCaml, OAAT, PJWHash, RSHash,  SDBM, Simple, SML, STL,\par
+    APHash, BKDR, DEKHash, DJBHash, FNV32, Hsieh\};\par
+\par
+double load_factor() \{\par
+    return 1.0 * cuckoo_hash_table.num_items / (cuckoo_hash_table.table_size + 0.0);\par
+\}\par
+\par
+void show_hash_table()\par
+\{\par
+    int i, j;\par
+\par
+    printf("Show all entries in the cuckoo hash table [key, value, status]:\\n");\par
+    for (i = 0; i < cuckoo_hash_table.bucket_num; i++) \{\par
+        printf("bucket[%02x]:", i);\par
+\par
+        struct hash_entry *items = cuckoo_hash_table.buckets[i];\par
+\par
+        for (j = 0; j < ASSOC_WAY; j++) \{\par
+            printf("\\t[%04x, %02x, %x]", items[j].key, items[j].value, items[j].status);\par
+        \}\par
+\par
+        printf("\\n");\par
+    \}\par
+\}\par
+\par
+static int cuckoo_hash_collide(struct hash_table *table, uint32_t *hash, uint32_t key, uint32_t value)\par
+\{\par
+    int j, k, alt_cnt;\par
+    uint32_t old_hash[2], alternate_hash;\par
+    uint32_t old_val, old_key;\par
+    struct hash_entry *items;\par
+\par
+    /* Kick out the old bucket and move it to the alternative bucket. */\par
+    //old_hash[0] = hash[0];\par
+    //old_hash[1] = hash[1];\par
+\par
+    items = table->buckets[hash[0]];\par
+\par
+    /* Obtain the old (key, value), and calculate the corresponding hashes */\par
+    old_key = items[0].key;\par
+    old_val = items[0].value;\par
+    \par
+    //old_hash[0] = old_key & (table->bucket_num - 1);\par
+    //old_hash[1] = (old_hash[0] + 11) & (table->bucket_num - 1);\par
+    \par
+    old_hash[0] = hash_func[0]((const unsigned char *)&old_key, sizeof(old_key)) % table->bucket_num;\par
+    old_hash[1] = hash_func[1]((const unsigned char *)&old_key, sizeof(old_key)) % table->bucket_num;\par
+\par
+    alternate_hash = (old_hash[0] == hash[0] ? old_hash[1] : old_hash[0]);\par
+\par
+    /* insert the new (key, value) into the current slot */\par
+    items[0].key = key;\par
+    items[0].value = value;\par
+\par
+    k = 0;\par
+    alt_cnt = 0;\par
+\par
+KICK_OUT:\par
+    items = table->buckets[alternate_hash];\par
+\par
+    for (j = 0; j < ASSOC_WAY; j++) \{\par
+        if (items[j].status == AVAILABLE) \{\par
+            items[j].status = OCCUPIED;\par
+            items[j].key = old_key;\par
+            items[j].value = old_val;\par
+            break;\par
+        \}\par
+    \}\par
+\par
+    if (j == ASSOC_WAY) \{\par
+        if (++alt_cnt > MAX_KICK_OUT) \{\par
+            if (k == ASSOC_WAY - 1) \{\par
+                /* Hash table is almost full and needs to be resized */\par
+                return 1;\par
+            \} else \{\par
+                k++;\par
+            \}\par
+        \}\par
+\par
+        uint32_t tmp_key = items[k].key;\par
+        uint32_t tmp_val = items[k].value;\par
+        items[k].key = old_key;\par
+        items[k].value = old_val;\par
+\par
+        old_key = tmp_key;\par
+        old_val = tmp_val;\par
+        //old_hash[0] = old_key & (table->bucket_num - 1);\par
+        //old_hash[1] = (old_hash[0] + 11) & (table->bucket_num - 1);\par
+        \par
+        old_hash[0] = hash_func[0]((const unsigned char *)&old_key, sizeof(old_key)) % table->bucket_num;\par
+        old_hash[1] = hash_func[1]((const unsigned char *)&old_key, sizeof(old_key)) % table->bucket_num;\par
+\par
+\par
+        alternate_hash = (old_hash[0] == alternate_hash ? old_hash[1] : old_hash[0]);\par
+\par
+        goto KICK_OUT;\par
+    \}\par
+\par
+    return 0;\par
+\}\par
+\par
+static int cuckoo_hash_get(struct hash_table *table, uint32_t key)\par
+\{\par
+    int i, j;\par
+    uint32_t hash[2];\par
+    uint32_t val;\par
+\par
+    struct hash_entry *items;\par
+\par
+    //hash[0] = key & (table->bucket_num - 1);\par
+    //hash[1] = (hash[0] + 11) & (table->bucket_num - 1);\par
+\par
+    hash[0] = hash_func[0]((const unsigned char *)&key, sizeof(key)) % table->bucket_num;\par
+    hash[1] = hash_func[1]((const unsigned char *)&key, sizeof(key)) % table->bucket_num;\par
+\par
+#ifdef CUCKOO_DEBUG\par
+    printf("get h0:%x h1:%x\\n", hash[0], hash[1]);\par
+#endif\par
+\par
+    /* Filter the key. */\par
+    items = table->buckets[hash[0]];\par
+\par
+    for (i = 0; i < ASSOC_WAY; i++) \{\par
+        if (key == items[i].key) \{\par
+            if (items[i].status == OCCUPIED) \{\par
+                val = items[i].value;\par
+                return val;\par
+            \}\par
+        \}\par
+    \}\par
+\par
+    if (i == ASSOC_WAY) \{\par
+        items = table->buckets[hash[1]];\par
+        for (j = 0; j < ASSOC_WAY; j++) \{\par
+            if (key == items[j].key) \{\par
+                if (items[j].status == OCCUPIED) \{\par
+                    val = items[j].value;\par
+                    return val;\par
+                \}\par
+            \}\par
+        \}\par
+\par
+        if (j == ASSOC_WAY) \{\par
+#ifdef CUCKOO_DEBUG\par
+            printf("Key not exists!\\n");\par
+#endif\par
+            return AVAILABLE;\par
+        \}\par
+    \}\par
+\par
+    return -1;\par
+\}\par
+\par
+static int cuckoo_hash_put(struct hash_table *table, uint32_t key, uint32_t value)\par
+\{\par
+    int i, j;\par
+    uint32_t hash[2];\par
+    struct hash_entry *items;\par
+\par
+    //hash[0] = key & (table->bucket_num - 1);\par
+    //hash[1] = (hash[0] + 11) & (table->bucket_num - 1);\par
+\par
+    hash[0] = hash_func[0]((const unsigned char *)&key, sizeof(key)) % table->bucket_num;\par
+    hash[1] = hash_func[1]((const unsigned char *)&key, sizeof(key)) % table->bucket_num;\par
+\par
+#ifdef CUCKOO_DEBUG\par
+    printf("put: value:%x h0:%x h1:%x\\n", value, hash[0], hash[1]);\par
+#endif\par
+\par
+    /* Insert new key into hash buckets. */\par
+    items = table->buckets[hash[0]];\par
+    for (i = 0; i < ASSOC_WAY; i++) \{\par
+        if (items[i].status == AVAILABLE) \{\par
+            items[i].status = OCCUPIED;\par
+            items[i].key = key;\par
+            items[i].value = value;\par
+            break;\par
+        \}\par
+    \}\par
+\par
+    if (i == ASSOC_WAY) \{\par
+        items = table->buckets[hash[1]];\par
+        for (j = 0; j < ASSOC_WAY; j++) \{\par
+            if (items[j].status == AVAILABLE) \{\par
+                items[j].status = OCCUPIED;\par
+                items[j].key = key;\par
+                items[j].value = value;\par
+                break;\par
+            \}\par
+        \}\par
+\par
+        if (j == ASSOC_WAY) \{\par
+            if (cuckoo_hash_collide(table, hash, key, value)) \{\par
+#ifdef CUCKOO_DEBUG\par
+                printf("Hash table collision!\\n");\par
+#endif\par
+                return -1;\par
+            \}\par
+        \}\par
+    \}\par
+\par
+#ifdef CUCKOO_DEBUG\par
+    show_hash_table();\par
+#endif\par
+\par
+    return 0;\par
+\}\par
+\par
+static void cuckoo_hash_remove(struct hash_table *table, uint32_t key)\par
+\{\par
+    uint32_t i, j, hash[2];\par
+    struct hash_entry *items;\par
+\par
+    //hash[0] = key & (table->bucket_num - 1);\par
+    //hash[1] = (hash[0] + 11) & (table->bucket_num - 1);\par
+\par
+    hash[0] = hash_func[0]((const unsigned char *)&key, sizeof(key)) % table->bucket_num;\par
+    hash[1] = hash_func[1]((const unsigned char *)&key, sizeof(key)) % table->bucket_num;\par
+\par
+#ifdef CUCKOO_DEBUG\par
+    printf("Remove: h0:%x h1:%x\\n", hash[0], hash[1]);\par
+#endif\par
+\par
+    items = table->buckets[hash[0]];\par
+\par
+    for (i = 0; i < ASSOC_WAY; i++) \{\par
+        if (key == items[i].key) \{\par
+            items[i].status = AVAILABLE;\par
+            items[i].key = 0;\par
+            items[i].value = 0;\par
+            cuckoo_hash_table.num_items --;\par
+            return;\par
+        \}\par
+    \}\par
+\par
+    if (i == ASSOC_WAY) \{\par
+        items = table->buckets[hash[1]];\par
+        for (j = 0; j < ASSOC_WAY; j++) \{\par
+            if (key == items[j].key) \{\par
+                items[j].status = AVAILABLE;\par
+                items[j].key = 0;\par
+                items[j].value = 0;\par
+                cuckoo_hash_table.num_items --;\par
+                return;\par
+            \}\par
+        \}\par
+\par
+        if (j == ASSOC_WAY) \{\par
+#ifdef CUCKOO_DEBUG\par
+            printf("Key not exists!\\n");\par
+#endif\par
+        \}\par
+    \}\par
+\}\par
+\par
+static void cuckoo_rehash(struct hash_table *table)\par
+\{\par
+    int i;\par
+    struct hash_table old_table;\par
+\par
+    /* Reallocate hash slots */\par
+    old_table.items = table->items;\par
+    old_table.table_size = table->table_size;\par
+\par
+    table->table_size *= 2;\par
+    table->items = calloc(table->table_size, sizeof(struct hash_entry));\par
+\par
+    if (table->items == NULL) \{\par
+        table->items = old_table.items;\par
+        return;\par
+    \}\par
+\par
+    /* Reallocate hash buckets associated with slots */\par
+    old_table.buckets = table->buckets;\par
+    old_table.bucket_num = table->bucket_num;\par
+\par
+    table->bucket_num *= 2;\par
+    table->buckets = malloc(table->bucket_num * sizeof(struct hash_entry *));\par
+\par
+    if (table->buckets == NULL) \{\par
+        free(table->items);\par
+        table->items = old_table.items;\par
+        table->buckets = old_table.buckets;\par
+        return;\par
+    \}\par
+\par
+    for (i = 0; i < table->bucket_num; i++) \{\par
+        table->buckets[i] = &table->items[i * ASSOC_WAY];\par
+    \}\par
+\par
+    /* Rehash all hash slots */\par
+    for (i = 0; i < old_table.bucket_num; i++) \{\par
+        /* Duplicated keys in hash table which can cause eternal\par
+         * hashing collision! Be careful of that!\par
+         */\par
+        assert(!cuckoo_hash_put(table, old_table.buckets[i]->key, old_table.buckets[i]->value));\par
+    \}\par
+\par
+    free(old_table.items);\par
+    free(old_table.buckets);\par
+\}\par
+\par
+void cuckoo_insert(uint32_t key, uint32_t value)\par
+\{\par
+    if (value != 0) \{\par
+        /* Reject duplicated keys keeping from eternal collision */\par
+        int status = cuckoo_hash_get(&cuckoo_hash_table, key);\par
+        if (status == OCCUPIED) \{\par
+            return;\par
+        \} else \{\par
+            /* Insert into hash slots */\par
+            if (cuckoo_hash_put(&cuckoo_hash_table, key, value) == -1) \{\par
+                //cuckoo_rehash(&cuckoo_hash_table);\par
+                cuckoo_hash_put(&cuckoo_hash_table, key, value);\par
+            \}\par
+\par
+            cuckoo_hash_table.num_items ++;\par
+        \}\par
+    \} else \{\par
+        /* Delete at the hash slot */\par
+        cuckoo_hash_remove(&cuckoo_hash_table, key);\par
+    \}\par
+\}\par
+\par
+void cuckoo_remove(uint32_t key) \{\par
+    cuckoo_hash_remove(&cuckoo_hash_table, key);\par
+#ifdef CUCKOO_DEBUG\par
+    show_hash_table();\par
+#endif\par
+\}\par
+\par
+int cuckoo_lookup(uint32_t key)\par
+\{\par
+    return cuckoo_hash_get(&cuckoo_hash_table, key);\par
+\}\par
+\par
+int cuckoo_hashing_init(size_t size)\par
+\{\par
+    int i;\par
+\par
+    /* Otain the hash table size, it must be the power of 2 */\par
+    cuckoo_hash_table.table_size = upper_pow_of_2(size);\par
+\par
+    /* Make rehashing happen */\par
+    //hash_table.slot_num /= 4;\par
+    cuckoo_hash_table.items = calloc(cuckoo_hash_table.table_size, sizeof(struct hash_entry));\par
+    if (cuckoo_hash_table.items == NULL) \{\par
+        return -1;\par
+    \}\par
+\par
+    /* Allocate hash buckets associated with slots */\par
+    cuckoo_hash_table.bucket_num = cuckoo_hash_table.table_size / ASSOC_WAY;\par
+    cuckoo_hash_table.buckets = malloc(cuckoo_hash_table.bucket_num * sizeof(struct hash_entry *));\par
+\par
+    if (cuckoo_hash_table.buckets == NULL) \{\par
+        free(cuckoo_hash_table.items);\par
+        return -1;\par
+    \}\par
+\par
+    for (i = 0; i < cuckoo_hash_table.bucket_num; i++) \{\par
+        cuckoo_hash_table.buckets[i] = &cuckoo_hash_table.items[i * ASSOC_WAY];\par
+    \}\par
+\par
+    return 0;\par
+\}\par
+\pard\ltrpar\sa200\sl276\slmult1\f1\par
+}
+ 
